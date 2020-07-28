@@ -243,7 +243,8 @@ METHOD_TO_CAPABILITY_EXCEPTIONS = {
     'workspace/symbol': ('workspaceSymbolProvider', None),
     'workspace/didChangeWorkspaceFolders': ('workspace.workspaceFolders',
                                             'workspace.workspaceFolders.changeNotifications'),
-    'textDocument/didOpen': ('textDocumentSync.openClose', None),
+    'textDocument/didOpen': ('textDocumentSync.didOpen', None),
+    'textDocument/didClose': ('textDocumentSync.didClose', None),
     'textDocument/didChange': ('textDocumentSync.change', None),
     'textDocument/didSave': ('textDocumentSync.save', None),
     'textDocument/willSave': ('textDocumentSync.willSave', None),
@@ -280,10 +281,13 @@ class SessionViewProtocol(Protocol):
     view = None  # type: sublime.View
     listener = None  # type: Any
 
-    def register_capability_async(self, capability_path: str, options: Any) -> None:
+    def on_capability_added_async(self, capability_path: str, options: Dict[str, Any]) -> None:
         ...
 
-    def unregister_capability_async(self, capability_path: str) -> None:
+    def on_capability_removed_async(self, discarded_capabilities: DottedDict) -> None:
+        ...
+
+    def has_capability_async(self, capability_path: str) -> bool:
         ...
 
     def shutdown_async(self) -> None:
@@ -296,9 +300,14 @@ class SessionViewProtocol(Protocol):
 class SessionBufferProtocol(Protocol):
 
     session = None  # type: Session
-    view = None  # type: sublime.View
     session_views = None  # type: WeakSet[SessionViewProtocol]
     file_name = None  # type: str
+
+    def register_capability_async(self, registration_id: str, capability_path: str, options: Dict[str, Any]) -> None:
+        ...
+
+    def unregister_capability_async(self, registration_id: str) -> None:
+        ...
 
     def on_diagnostics_async(self, diagnostics: List[Dict[str, Any]], version: Optional[int]) -> None:
         ...
@@ -469,6 +478,263 @@ def get_plugin(name: str) -> Optional[Type[AbstractPlugin]]:
     return _plugins.get(name, None)
 
 
+class _ViewFilter(metaclass=ABCMeta):
+
+    __slots__ = ()
+
+    @abstractmethod
+    def matches(self, view: sublime.View) -> bool:
+        pass
+
+    def __call__(self, view: sublime.View) -> bool:
+        return self.matches(view)
+
+
+class _LanguageIdViewFilter(_ViewFilter):
+
+    __slots__ = ("_language_id",)
+
+    def __init__(self, language_id: str) -> None:
+        self._language_id = language_id
+
+    def matches(self, view: sublime.View) -> bool:
+        return view.settings().get("lsp_language_id") == self._language_id
+
+
+class _SublimeSelectorViewFilter(_ViewFilter):
+
+    __slots__ = ("_selector",)
+
+    def __init__(self, selector: str) -> None:
+        self._selector = selector
+
+    def matches(self, view: sublime.View) -> bool:
+        return view.match_selector(0, self._selector) > 0
+
+
+class _SchemeViewFilter(_ViewFilter):
+
+    __slots__ = ("_scheme",)
+
+    def __init__(self, scheme: str) -> None:
+        self._scheme = scheme
+
+    def matches(self, view: sublime.View) -> bool:
+        debug("Don't know what to do with scheme", self._scheme)
+        return True
+
+
+class _PatternViewFilter(_ViewFilter):
+
+    __slots__ = ("_pattern",)
+
+    def __init__(self, pattern: str) -> None:
+        self._pattern = pattern
+
+    def matches(self, view: sublime.View) -> bool:
+        file_name = view.file_name()
+        if not file_name:
+            return False
+        debug("Need to use wcmatch library")
+        return True
+
+
+class ViewSelector:
+
+    __slots__ = ("_filters",)
+
+    def __init__(self, document_selector: List[Dict[str, Any]]) -> None:
+        self._filters = []  # type: List[_ViewFilter]
+        for document_filter in document_selector:
+            language_id = document_filter.get("languageId")
+            scheme = document_filter.get("scheme")
+            pattern = document_filter.get("pattern")
+            selector = document_filter.get("selector")  # Sublime extension
+            if language_id:
+                self._filters.append(_LanguageIdViewFilter(language_id))
+            elif scheme:
+                self._filters.append(_SchemeViewFilter(scheme))
+            elif pattern:
+                self._filters.append(_PatternViewFilter(pattern))
+            elif selector:
+                self._filters.append(_SublimeSelectorViewFilter(selector))
+            else:
+                debug("unknown document filter:", document_filter)
+
+    def matches(self, view: sublime.View) -> bool:
+        return any(filter(lambda f: f.matches(view), self._filters)) if self._filters else True
+
+    def __call__(self, view: sublime.View) -> bool:
+        return self.matches(view)
+
+
+class _TextSyncPartBase:
+
+    __slots__ = ("registration_id",)
+
+    def __init__(self, registration_id: Optional[str]) -> None:
+        self.registration_id = registration_id
+
+
+
+class _DidOpenTextSync(_TextSyncPartBase):
+
+    __slots__ = ()
+
+    def __init__(self, registration_id: Optional[str]) -> None:
+        super().__init__(registration_id)
+
+
+class _ChangeTextSync(_TextSyncPartBase):
+
+    __slots__ = ("sync_kind",)
+
+    def __init__(self, registration_id: Optional[str], sync_kind: int) -> None:
+        super().__init__(registration_id)
+        self.sync_kind = sync_kind
+
+
+class _WillSaveTextSync(_TextSyncPartBase):
+
+    __slots__ = ()
+
+    def __init__(self, registration_id: Optional[str]) -> None:
+        super().__init__(registration_id)
+
+
+class _WillSaveWaitUntilTextSync(_TextSyncPartBase):
+
+    __slots__ = ()
+
+    def __init__(self, registration_id: Optional[str]) -> None:
+        super().__init__(registration_id)
+
+
+class _DidSaveTextSync(_TextSyncPartBase):
+
+    __slots__ = ("include_text",)
+
+    def __init__(self, registration_id: Optional[str], include_text: bool) -> None:
+        super().__init__(registration_id)
+        self.include_text = include_text
+
+
+class TextSync:
+
+    __slots__ = ("did_open", "change", "will_save", "will_save_wait_until", "did_save", "did_close")
+
+    def __init__(self) -> None:
+        self.did_open = None  # type: Optional[_DidOpenTextSync]
+        self.change = None  # type: Optional[_ChangeTextSync]
+        self.will_save = None  # type: Optional[_WillSaveTextSync]
+        self.will_save_wait_until = None  # type: Optional[_WillSaveWaitUntilTextSync]
+        self.did_save = None  # type: Optional[_DidSaveTextSync]
+        self.did_close = None  # type: Optional[DidCloseTextSync]
+
+    @classmethod
+    def from_legacy_integer(cls, change: int) -> "TextSync":
+        result = cls()
+        result.did_open = _DidOpenTextSync(None)
+        result.change = _ChangeTextSync(None, change)
+        result.did_close = DidCloseTextSync(None)
+        return result
+
+    @classmethod
+    def from_dict(cls, textsync: Dict[str, Any]) -> "TextSync":
+        result = cls()
+        if "openClose" in textsync:
+            result.did_open = _DidOpenTextSync(None)
+            result.did_close = DidCloseTextSync(None)
+        change_kind = textsync.get("change")
+        if isinstance(change_kind, int):
+            result.change = _ChangeTextSync(None, change_kind)
+        if "willSave" in textsync:
+            result.will_save = _WillSaveTextSync(None)
+        if "willSaveWaitUntil" in textsync:
+            result.will_save_wait_until = _WillSaveWaitUntilTextSync(None)
+        save = textsync.get("save")
+        if isinstance(save, bool):
+            if save:
+                result.did_save = _DidSaveTextSync(None, False)
+        elif isinstance(save, dict):
+            result.did_save = _DidSaveTextSync(None, bool(save.get("includeText", False)))
+        return result
+
+    def add_registration(
+        self,
+        registration_id: str,
+        capability_path: str,
+        options: Optional[Dict[str, Any]]
+    ) -> None:
+        tail = capability_path.split(".")[-1]
+        if tail == "didOpen":
+            self.did_open = _DidOpenTextSync(registration_id)
+        elif tail == "change":
+            self.change = _ChangeTextSync(registration_id, int(options.get("syncKind", 1)))
+        elif tail == "willSave":
+            self.will_save = _WillSaveTextSync(registration_id)
+        elif tail == "willSaveWaitUntil":
+            self.will_save_wait_until = _WillSaveWaitUntilTextSync(registration_id)
+        elif tail == "didSave":
+            self.did_save = _DidSaveTextSync(registration_id, bool(options.get("includeText", False)))
+        elif tail == "didClose":
+            self.did_close = DidCloseTextSync(registration_id)
+        else:
+            debug("unknown text sync capability:", capability_path)
+
+    def discard_registration(self, registration_id: str) -> None:
+        for slot in self.__slots__:
+            attr = getattr(self, slot, None)
+            if isinstance(attr, _TextSyncPartBase) and attr.registration_id == registration_id:
+                setattr(self, slot, None)
+
+    def should_notify_did_open(self) -> bool:
+        return bool(self.did_open)
+
+    def text_sync_kind(self) -> int:
+        return self.change.sync_kind if self.change else TextDocumentSyncKindNone
+
+    def should_notify_did_change(self) -> bool:
+        return self.text_sync_kind() > TextDocumentSyncKindNone
+
+    def should_notify_will_save(self) -> bool:
+        return bool(self.will_save)
+
+    def should_notify_did_save(self) -> Tuple[bool, bool]:
+        if self.did_save:
+            return True, self.did_save.include_text
+        return False, False
+
+    def should_notify_did_close(self) -> bool:
+        return bool(self.did_close)
+
+
+class _RegistrationData:
+
+    __slots__ = ("registration_id", "capability_path", "options", "session_buffers", "selector")
+
+    def __init__(self, registration_id: str, capability_path: str, options: Dict[str, Any]) -> None:
+        self.registration_id = registration_id
+        self.capability_path = capability_path
+        document_selector = options.pop("documentSelector", None)
+        if not isinstance(document_selector, list):
+            document_selector = []
+        self.selector = ViewSelector(document_selector)
+        self.options = options
+        self.session_buffers = WeakSet()  # type: WeakSet[SessionBufferProtocol]
+
+    def __del__(self) -> None:
+        for sb in self.session_buffers:
+            sb.unregister_capability_async(self.registration_id)
+
+    def check(self, sb: SessionBufferProtocol) -> None:
+        for sv in sb.session_views:
+            if self.selector.matches(sv.view):
+                self.session_buffers.add(sb)
+                sb.register_capability_async(self.registration_id, self.capability_path, self.options)
+            return
+
+
 class Session(Client):
 
     def __init__(self, manager: Manager, logger: Logger, workspace_folders: List[WorkspaceFolder],
@@ -478,7 +744,9 @@ class Session(Client):
         self.manager = weakref.ref(manager)
         self.window = manager.window()
         self.state = ClientStates.STARTING
-        self.capabilities = DottedDict()
+        self.textsync = None  # type: Optional[TextSync]
+        self._static_capabilities = DottedDict()
+        self._dynamic_registrations = {}  # type: Dict[str, _RegistrationData]
         self.exiting = False
         self._init_callback = None  # type: Optional[InitCallback]
         self._exit_result = None  # type: Optional[Tuple[int, Optional[Exception]]]
@@ -525,10 +793,18 @@ class Session(Client):
         """
         yield from self._session_views
 
+    def session_view_for_view_async(self, view: sublime.View) -> Optional[SessionViewProtocol]:
+        for sv in self.session_views_async():
+            if sv.view == view:
+                return sv
+        return None
+
     # --- session buffer management ------------------------------------------------------------------------------------
 
     def register_session_buffer_async(self, sb: SessionBufferProtocol) -> None:
         self._session_buffers.add(sb)
+        for data in self._dynamic_registrations.values():
+            data.check(sb)
 
     def unregister_session_buffer_async(self, sb: SessionBufferProtocol) -> None:
         self._session_buffers.discard(sb)
@@ -554,8 +830,11 @@ class Session(Client):
     def can_handle(self, view: sublime.View, capability: Optional[str] = None) -> bool:
         file_name = view.file_name() or ''
         if self.config.match_view(view) and self.state == ClientStates.READY and self.handles_path(file_name):
-            if capability is None or capability in self.capabilities:
+            # If there's no capability requirement then this session can handle the view
+            if capability is None:
                 return True
+            sv = self.session_view_for_view_async(view)
+            return sv.has_capability_async(capability) if sv is not None else self.has_capability(capability)
         return False
 
     def has_capability(self, capability: str) -> bool:
@@ -563,50 +842,9 @@ class Session(Client):
         return value is not False and value is not None
 
     def get_capability(self, capability: str) -> Optional[Any]:
-        return self.capabilities.get(capability)
+        return self._static_capabilities.get(capability)
 
-    def should_notify_did_open(self) -> bool:
-        if self.has_capability('textDocumentSync.openClose'):
-            return True
-        textsync = self.get_capability('textDocumentSync')
-        return isinstance(textsync, int) and textsync > TextDocumentSyncKindNone
-
-    def text_sync_kind(self) -> int:
-        textsync = self.capabilities.get('textDocumentSync')
-        if isinstance(textsync, dict):
-            change = textsync.get('change', TextDocumentSyncKindNone)
-            if isinstance(change, dict):
-                # dynamic registration
-                return TextDocumentSyncKindIncremental  # or TextDocumentSyncKindFull?
-            return int(change)
-        if isinstance(textsync, int):
-            return textsync
-        return TextDocumentSyncKindNone
-
-    def should_notify_did_change(self) -> bool:
-        return self.text_sync_kind() > TextDocumentSyncKindNone
-
-    def should_notify_will_save(self) -> bool:
-        return self.has_capability('textDocumentSync.willSave')
-
-    def should_notify_did_save(self) -> Tuple[bool, bool]:
-        textsync = self.capabilities.get('textDocumentSync')
-        if isinstance(textsync, dict):
-            options = textsync.get('save')
-            if isinstance(options, dict):
-                return True, bool(options.get('includeText'))
-            elif isinstance(options, bool):
-                return options, False
-        return False, False
-
-    def should_notify_did_close(self) -> bool:
-        return self.should_notify_did_open()
-
-    def should_notify_did_change_workspace_folders(self) -> bool:
-        return self.has_capability("workspace.workspaceFolders.changeNotifications")
-
-    def should_notify_did_change_configuration(self) -> bool:
-        return self.has_capability("didChangeConfigurationProvider")
+    # --- misc methods -------------------------------------------------------------------------------------------------
 
     def handles_path(self, file_path: Optional[str]) -> bool:
         if self._supports_workspace_folders():
@@ -643,8 +881,13 @@ class Session(Client):
         self._init_callback = init_callback
         self.send_request(Request.initialize(params), self._handle_initialize_success, self._handle_initialize_error)
 
-    def _handle_initialize_success(self, result: Any) -> None:
-        self.capabilities.assign(result.get('capabilities', dict()))
+    def _handle_initialize_success(self, result: Dict[str, Any]) -> None:
+        textsync = result.pop("textDocumentSync", None)
+        if isinstance(textsync, int):
+            self.textsync = TextSync.from_legacy_integer(textsync)
+        elif isinstance(textsync, dict):
+            self.textsync = TextSync.from_dict(textsync)
+        self._static_capabilities.assign(result.get('capabilities', dict()))
         if self._workspace_folders and not self._supports_workspace_folders():
             self._workspace_folders = self._workspace_folders[:1]
         self.state = ClientStates.READY
@@ -749,14 +992,16 @@ class Session(Client):
         def run() -> None:
             registrations = params["registrations"]
             for registration in registrations:
-                method = registration["method"]
-                capability_path, registration_path = method_to_capability(method)
+                registration_id = registration["id"]
+                capability_path, _ = method_to_capability(registration["method"])
                 debug("{}: registering capability:".format(self.config.name), capability_path)
-                options = registration.get("registerOptions", {})
-                self.capabilities.set(capability_path, options)
-                self.capabilities.set(registration_path, registration["id"])
-                for sv in self.session_views_async():
-                    sv.register_capability_async(capability_path, options)
+                options = registration.get("registerOptions")  # type: Optional[Dict[str, Any]]
+                if not isinstance(options, dict):
+                    options = {}
+                data = _RegistrationData(registration_id, capability_path, options)
+                self._dynamic_registrations[registration_id] = data
+                for sb in self.session_buffers_async():
+                    data.check(sb)
             self.send_response(Response(request_id, None))
 
         sublime.set_timeout_async(run)
@@ -767,12 +1012,10 @@ class Session(Client):
         def run() -> None:
             unregistrations = params["unregisterations"]  # typo in the official specification
             for unregistration in unregistrations:
-                capability_path, registration_path = method_to_capability(unregistration["method"])
-                debug("{}: unregistering capability:".format(self.config.name), capability_path)
-                self.capabilities.remove(capability_path)
-                self.capabilities.remove(registration_path)
-                for sv in self.session_views_async():
-                    sv.unregister_capability_async(capability_path)
+                data = self._dynamic_registrations.pop(unregistration["id"], None)
+                if data is None:
+                    continue
+                debug("{}: unregistering capability:".format(self.config.name), data.capability_path)
             self.send_response(Response(request_id, None))
 
         sublime.set_timeout_async(run)
@@ -830,7 +1073,9 @@ class Session(Client):
         self._plugin = None
         for sv in self.session_views_async():
             sv.shutdown_async()
-        self.capabilities.clear()
+        self._static_capabilities.clear()
+        self._dynamic_registrations.clear()
+        self.textsync = None
         self.state = ClientStates.STOPPING
         self.send_request(Request.shutdown(), self._handle_shutdown_result, self._handle_shutdown_result)
 

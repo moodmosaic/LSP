@@ -120,7 +120,7 @@ class SessionTest(unittest.TestCase):
         manager = MockManager(sublime.active_window())
         session = Session(manager=manager, logger=MockLogger(), workspace_folders=[], config=TEST_CONFIG,
                           plugin_class=None)
-        session.capabilities.assign({
+        session._static_registrations.assign({
             'textDocumentSync': {
                 "openClose": True,
                 "change": TextDocumentSyncKindFull,
@@ -132,7 +132,7 @@ class SessionTest(unittest.TestCase):
         self.assertFalse(session.should_notify_will_save())
         self.assertEqual(session.should_notify_did_save(), (True, False))
 
-        session.capabilities.assign({
+        session._static_registrations.assign({
             'textDocumentSync': {
                 "openClose": False,
                 "change": TextDocumentSyncKindNone,
@@ -152,7 +152,7 @@ class SessionTest(unittest.TestCase):
         self.assertFalse(session.has_capability('textDocumentSync.willSaveUntil'))
         self.assertFalse(session.has_capability('textDocumentSync.aintthere'))
 
-        session.capabilities.assign({
+        session._static_registrations.assign({
             'textDocumentSync': {
                 "openClose": False,
                 "change": TextDocumentSyncKindIncremental,
@@ -166,7 +166,7 @@ class SessionTest(unittest.TestCase):
         self.assertFalse(session.should_notify_will_save())
         self.assertEqual(session.should_notify_did_save(), (True, True))
 
-        session.capabilities.assign({'textDocumentSync': TextDocumentSyncKindIncremental})
+        session._static_registrations.assign({'textDocumentSync': TextDocumentSyncKindIncremental})
         self.assertTrue(session.should_notify_did_open())
         self.assertTrue(session.should_notify_did_close())
         self.assertEqual(session.text_sync_kind(), TextDocumentSyncKindIncremental)
@@ -174,7 +174,7 @@ class SessionTest(unittest.TestCase):
         self.assertFalse(session.should_notify_will_save())  # old-style text sync will never send willSave
         self.assertEqual(session.should_notify_did_save(), (False, False))
 
-        session.capabilities.assign({'textDocumentSync': TextDocumentSyncKindNone})
+        session._static_registrations.assign({'textDocumentSync': TextDocumentSyncKindNone})
         self.assertFalse(session.should_notify_did_open())
         self.assertFalse(session.should_notify_did_close())
         self.assertEqual(session.text_sync_kind(), TextDocumentSyncKindNone)
@@ -182,7 +182,7 @@ class SessionTest(unittest.TestCase):
         self.assertFalse(session.should_notify_will_save())
         self.assertEqual(session.should_notify_did_save(), (False, False))
 
-        session.capabilities.assign({
+        session._static_registrations.assign({
             'textDocumentSync': {
                 "openClose": True,
                 "save": False,
